@@ -25,7 +25,7 @@ tokenized_query_path = os.path.join(path_to_save_df, "tokenized_query.pkl")
 nltk.download("punkt_tab")
 nltk.download("stopwords")
 
-nlp = spacy.load('en_core_web_sm', disable=['ner', 'parser', 'tagger'])
+nlp = spacy.load("en_core_web_sm", disable=["ner", "parser", "tagger"])
 
 
 # Create the directory if it does not exist
@@ -91,26 +91,33 @@ def preprocess(text, lan, docid):
     # Extra whitespace removal
     for _ in range(10):
         text = text.replace("  ", " ")
-        
+
     # print("After Preprocessing: ", len(text), docid)
 
     return text
 
+
 def process_batch(batch_df, path_to_save_df, batch_index):
     preprocessed_data = Parallel(n_jobs=-1)(
-        delayed(lambda row: (row["docid"], preprocess(row["text"], row["lang"], row["docid"]))) (row)
+        delayed(
+            lambda row: (
+                row["docid"],
+                preprocess(row["text"], row["lang"], row["docid"]),
+            )
+        )(row)
         for _, row in tqdm(batch_df.iterrows(), total=len(batch_df))
     )
     preprocessed_text_df = pd.DataFrame(
         preprocessed_data, columns=["doc_id", "preprocessed_text"]
     )
-    
+
     batch_file_path = os.path.join(
         path_to_save_df, f"preprocessed_text_df_batch_{batch_index}.pkl"
     )
     preprocessed_text_df.to_pickle(batch_file_path)
     print(f"Batch {batch_index} saved.")
-    
+
+
 def compute_fasttext_embeddings(texts, model):
     embeddings = []
     for text in tqdm(texts):
@@ -121,14 +128,25 @@ def compute_fasttext_embeddings(texts, model):
         embeddings.append(sentence_embedding)
     return embeddings
 
+
 def batch_tokenize(texts, ids, tokenizer, device, batch_size=32):
     tokenized_batches = []
     for i in tqdm(range(0, len(texts), batch_size)):
-        batch_texts = texts[i:i + batch_size]
-        batch_docids = ids[i:i + batch_size]
-        batch = [{"id": docid, "text": text} for docid, text in zip(batch_docids, batch_texts)]
-        tokenized_batch = tokenizer([item["text"] for item in batch], padding=True, truncation=True, return_tensors="pt")
-        tokenized_batch = {key: value.to(device) for key, value in tokenized_batch.items()}
+        batch_texts = texts[i : i + batch_size]
+        batch_docids = ids[i : i + batch_size]
+        batch = [
+            {"id": docid, "text": text}
+            for docid, text in zip(batch_docids, batch_texts)
+        ]
+        tokenized_batch = tokenizer(
+            [item["text"] for item in batch],
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+        )
+        tokenized_batch = {
+            key: value.to(device) for key, value in tokenized_batch.items()
+        }
         tokenized_batches.append({"batch": batch, "tokenized": tokenized_batch})
     return tokenized_batches
 
@@ -139,7 +157,7 @@ def batch_tokenize(texts, ids, tokenizer, device, batch_size=32):
 if os.path.exists(os.path.join(path_to_save_df, "corpus_df.pkl")):
     print("Corpus DataFrame found. Loading it now.")
 
-    #corpus_df = pd.read_pickle(os.path.join(path_to_save_df, "corpus_df.pkl"))
+    # corpus_df = pd.read_pickle(os.path.join(path_to_save_df, "corpus_df.pkl"))
     # print(corpus_df.head())
 else:
     print("Corpus DataFrame not found. Creating it now.")
@@ -157,9 +175,9 @@ else:
 # Check if the preprocessed corpus is already saved
 if os.path.exists(os.path.join(path_to_save_df, "preprocessed_text_df.pkl")):
     print("Preprocessed Text found. Loading it now.")
-    preprocessed_text_df = pd.read_pickle(
-        os.path.join(path_to_save_df, "preprocessed_text_df.pkl")
-    )
+    # preprocessed_text_df = pd.read_pickle(
+    #     os.path.join(path_to_save_df, "preprocessed_text_df.pkl")
+    # )
 else:
     print("Preprocessed Text not found. Creating it now.")
     batch_size = 10000  # Define your batch size
@@ -193,19 +211,24 @@ if os.path.exists(os.path.join(path_to_save_df, "train_query_preprocessed.pkl"))
 else:
     print("Preprocessed query not found. Creating it now.")
     train_query = pd.read_csv(path_to_train_query)
-    batch_size = 10000  # Define your batch size 
+    batch_size = 10000  # Define your batch size
     num_batches = len(train_query) // batch_size + 1
-    
+
     for i in range(num_batches):
         batch_df = train_query.iloc[i * batch_size : (i + 1) * batch_size]
         preprocessed_data = Parallel(n_jobs=-1)(
-            delayed(lambda row: (row["query"], preprocess(row["query"], row["lang"], row["query_id"]))) (row)
+            delayed(
+                lambda row: (
+                    row["query"],
+                    preprocess(row["query"], row["lang"], row["query_id"]),
+                )
+            )(row)
             for _, row in tqdm(batch_df.iterrows(), total=len(batch_df))
         )
         preprocessed_query_df = pd.DataFrame(
             preprocessed_data, columns=["query_id", "preprocessed_query"]
         )
-        
+
         batch_file_path = os.path.join(
             path_to_save_df, f"train_query_preprocessed_batch_{i}.pkl"
         )
@@ -219,21 +242,20 @@ else:
             path_to_save_df, f"train_query_preprocessed_batch_{i}.pkl"
         )
         preprocessed_query_dfs.append(pd.read_pickle(batch_file_path))
-    
+
     preprocessed_query_df = pd.concat(preprocessed_query_dfs, ignore_index=True)
     preprocessed_query_df.to_pickle(
         os.path.join(path_to_save_df, "train_query_preprocessed.pkl")
     )
     print("Preprocessed query saved.")
-        
-    
-## COMPUTE THE TOKEN 
+
+
+## COMPUTE THE TOKEN
 
 # Loading the Model
 device = "cuda" if torch.cuda.is_available() else "cpu"
 tokenizer = AutoTokenizer.from_pretrained("bert-base-uncased")
 model = AutoModel.from_pretrained("bert-base-uncased").to(device)
-
 
 
 # Load the preprocessed text and query
@@ -253,13 +275,21 @@ if os.path.exists(os.path.join(path_to_save_df, "tokenized_text.pkl")):
     # tokenized_text_batches = torch.load(tokenized_text_path)
     # tokenized_query_batches = torch.load(tokenized_query_path)
 
-    
+
 else:
     print("Tokenized text and query not found. Tokenizing them now.")
-    tokenized_text_batches = batch_tokenize(preprocessed_text_df["preprocessed_text"].tolist(), preprocessed_text_df["doc_id"].tolist(), tokenizer, device)
-    tokenized_query_batches = batch_tokenize(preprocessed_query_df["preprocessed_query"].tolist(), preprocessed_query_df["query_id"].tolist(), tokenizer, device)
-
-
+    tokenized_text_batches = batch_tokenize(
+        preprocessed_text_df["preprocessed_text"].tolist(),
+        preprocessed_text_df["doc_id"].tolist(),
+        tokenizer,
+        device,
+    )
+    tokenized_query_batches = batch_tokenize(
+        preprocessed_query_df["preprocessed_query"].tolist(),
+        preprocessed_query_df["query_id"].tolist(),
+        tokenizer,
+        device,
+    )
 
     torch.save(tokenized_text_batches, tokenized_text_path)
     torch.save(tokenized_query_batches, tokenized_query_path)
@@ -267,12 +297,16 @@ else:
 
 ## COMPUTE THE EMBEDDINGS
 if os.path.exists(os.path.join(path_to_save_df, "preprocessed_text_embeddings.pkl")):
-    preprocessed_text_embeddings_path = os.path.join(path_to_save_df, "preprocessed_text_embeddings.pkl")
-    preprocessed_query_embeddings_path = os.path.join(path_to_save_df, "preprocessed_query_embeddings.pkl")
+    preprocessed_text_embeddings_path = os.path.join(
+        path_to_save_df, "preprocessed_text_embeddings.pkl"
+    )
+    preprocessed_query_embeddings_path = os.path.join(
+        path_to_save_df, "preprocessed_query_embeddings.pkl"
+    )
     print("Text embeddings found. Loading them now.")
     # text_embeddings_dict = pd.read_pickle(os.path.join(path_to_save_df, "preprocessed_text_embeddings.pkl"))
 else:
-    
+
     text_embeddings_dict = {}
     query_embeddings_dict = {}
 
@@ -281,26 +315,33 @@ else:
         with torch.no_grad():
             outputs = model(**batch["tokenized"])
             batch_embeddings = outputs.last_hidden_state.mean(dim=1).cpu().numpy()
-            for docid, embedding in zip([item["id"] for item in batch["batch"]], batch_embeddings):
+            for docid, embedding in zip(
+                [item["id"] for item in batch["batch"]], batch_embeddings
+            ):
                 text_embeddings_dict[docid] = embedding
 
     # Save the text embeddings dictionary
-    preprocessed_text_embeddings_path = os.path.join(path_to_save_df, "preprocessed_text_embeddings.pkl")
+    preprocessed_text_embeddings_path = os.path.join(
+        path_to_save_df, "preprocessed_text_embeddings.pkl"
+    )
     pd.to_pickle(text_embeddings_dict, preprocessed_text_embeddings_path)
-
 
     # Process query batches
     for batch in tqdm(tokenized_query_batches, desc="Processing query batches"):
         with torch.no_grad():
             outputs = model(**batch["tokenized"])
             batch_embeddings = outputs.last_hidden_state.mean(dim=1).cpu().numpy()
-            for docid, embedding in zip([item["id"] for item in batch["batch"]], batch_embeddings):
+            for docid, embedding in zip(
+                [item["id"] for item in batch["batch"]], batch_embeddings
+            ):
                 query_embeddings_dict[docid] = embedding
 
     # Save the query embeddings dictionary
-    preprocessed_query_embeddings_path = os.path.join(path_to_save_df, "preprocessed_query_embeddings.pkl")
+    preprocessed_query_embeddings_path = os.path.join(
+        path_to_save_df, "preprocessed_query_embeddings.pkl"
+    )
     pd.to_pickle(query_embeddings_dict, preprocessed_query_embeddings_path)
-    
+
 ## COMPUTE ANN SEARCH
 
 # Load the embeddings
@@ -308,19 +349,21 @@ text_embeddings_dict = pd.read_pickle(preprocessed_text_embeddings_path)
 query_embeddings_dict = pd.read_pickle(preprocessed_query_embeddings_path)
 
 # Convert embeddings to numpy arrays
-text_embeddings_array = np.array(list(text_embeddings_dict.values())).astype('float32')
-query_embeddings_array = np.array(list(query_embeddings_dict.values())).astype('float32')
+text_embeddings_array = np.array(list(text_embeddings_dict.values())).astype("float32")
+query_embeddings_array = np.array(list(query_embeddings_dict.values())).astype(
+    "float32"
+)
 
-# Build the FAISS index and move it to GPU
-res = faiss.StandardGpuResources()
-index_flat = faiss.IndexFlatL2(text_embeddings_array.shape[1])
-gpu_index = faiss.index_cpu_to_gpu(res, 0, index_flat)
-gpu_index.add(text_embeddings_array)
+# Build the FAISS index
+# Create a CPU index
+index = faiss.IndexFlatL2(d)  # where d is the dimensionality of your vectors
+
 
 # Function to perform ANN search for a single query embedding
 def ann_search(query_embedding):
     distances, indices = gpu_index.search(query_embedding.reshape(1, -1), k)
     return distances[0], indices[0]
+
 
 # Perform ANN search for each query embedding using multiprocessing
 k = 10  # Number of nearest neighbors to retrieve
@@ -329,10 +372,18 @@ query_ids = list(query_embeddings_dict.keys())
 doc_ids = list(text_embeddings_dict.keys())
 
 with Pool(cpu_count()) as pool:
-    results = list(tqdm(pool.imap(ann_search, query_embeddings_array), total=len(query_embeddings_array), desc="Performing ANN search"))
+    results = list(
+        tqdm(
+            pool.imap(ann_search, query_embeddings_array),
+            total=len(query_embeddings_array),
+            desc="Performing ANN search",
+        )
+    )
 
 for i, (distances, indices) in enumerate(results):
-    ranked_documents_dict[query_ids[i]] = {doc_ids[idx]: distances[j] for j, idx in enumerate(indices)}
+    ranked_documents_dict[query_ids[i]] = {
+        doc_ids[idx]: distances[j] for j, idx in enumerate(indices)
+    }
 
 # Save the ranked documents dictionary
 ranked_documents_path = os.path.join(path_to_save_df, "ranked_documents.pkl")
