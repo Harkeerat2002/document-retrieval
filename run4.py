@@ -1,6 +1,3 @@
-# Install cupy if not already installed
-# !pip install cupy-cuda11x  # Uncomment this line to install cupy
-
 import cupy as cp
 import pandas as pd
 import numpy as np
@@ -17,6 +14,8 @@ from scipy.sparse import lil_matrix, save_npz, load_npz
 from sklearn.metrics import f1_score
 import nltk
 from scipy.sparse import csr_matrix, vstack
+import faiss
+from sklearn.decomposition import TruncatedSVD
 
 nltk.download("stopwords")
 
@@ -30,11 +29,13 @@ tokenized_query_path = os.path.join(path_to_save_df, "tokenized_query.pkl")
 stop_words = set(stopwords.words("english"))
 stemmer = PorterStemmer()
 
+
 # HELPER FUNCTIONS
 def preprocess(text):
     text = text.lower().translate(str.maketrans("", "", string.punctuation))
     words = [stemmer.stem(word) for word in text.split() if word not in stop_words]
     return " ".join(words)
+
 
 def process_batch(batch_df, path_to_save_df, batch_index):
     preprocessed_data = Parallel(n_jobs=-1)(
@@ -48,6 +49,7 @@ def process_batch(batch_df, path_to_save_df, batch_index):
         path_to_save_df, f"preprocessed_text_df_batch_{batch_index}.pkl"
     )
     preprocessed_text_df.to_pickle(batch_file_path)
+
 
 def compute_tf_idf(corpus=None):
     tf_dict = defaultdict(lambda: defaultdict(int))
@@ -94,14 +96,58 @@ def compute_tf_idf(corpus=None):
 
     return tf_idf_dict
 
+
 def sparse_vectorize_query(query, tf_idf_dict, vocab):
     query_vector = lil_matrix((1, len(vocab)))
     for word in query.split():
         if word in vocab:
             tf = query.count(word) / len(query.split())
-            idf = np.log(len(tf_idf_dict) / (1 + sum(1 for doc in tf_idf_dict.values() if word in doc)))
+            idf = np.log(
+                len(tf_idf_dict)
+                / (1 + sum(1 for doc in tf_idf_dict.values() if word in doc))
+            )
             query_vector[0, vocab[word]] = tf * idf
     return query_vector.tocsr()
+
+
+# FAISS-based ANN ranking function
+def rank_documents_with_faiss(train_queries, svd, index):
+    ranked_documents_dict = {}
+    true_labels = []
+    predicted_labels = []
+
+    for i in tqdm(
+        range(0, len(train_queries), batch_size), desc="Batch processing queries"
+    ):
+        batch_queries = train_queries.iloc[i : i + batch_size]
+        batch_query_ids = batch_queries["query_id"]
+
+        # Vectorize and reduce query dimensions with the fitted SVD
+        batch_query_vectors = [
+            sparse_vectorize_query(query, tf_idf_dict, vocab).toarray().flatten()
+            for query in batch_queries["preprocessed_query"]
+        ]
+        batch_query_vectors = svd.transform(
+            np.array(batch_query_vectors).astype(np.float32)
+        )
+        faiss.normalize_L2(batch_query_vectors)
+
+        # Perform FAISS ANN search with reduced vectors
+        top_k = 10
+        _, top_k_indices = index.search(batch_query_vectors, top_k)
+
+        # Collect results
+        for j, query_id in enumerate(batch_query_ids):
+            ranked_documents_dict[query_id] = top_k_indices[j]
+            true_labels.append(
+                train_queries.loc[
+                    train_queries["query_id"] == query_id, "positive_docs"
+                ].values[0]
+            )
+            predicted_labels.append(top_k_indices[j])
+
+    return ranked_documents_dict, true_labels, predicted_labels
+
 
 # Load the preprocessed corpus DataFrame
 if os.path.exists(os.path.join(path_to_save_df, "corpus_df.pkl")):
@@ -149,13 +195,13 @@ else:
 
 if os.path.exists(os.path.join(path_to_save_df, "tf_idf_dict.json")):
     print("Loading the TF-IDF dictionary...")
-    with open(os.path.join(path_to_save_df, "tf_idf_dict.json"), "r") as f:
-        tf_idf_dict = json.load(f)
+    # with open(os.path.join(path_to_save_df, "tf_idf_dict.json"), "r") as f:
+    #     tf_idf_dict = json.load(f)
 else:
     print("Computing the TF-IDF dictionary...")
     tf_idf_dict = compute_tf_idf(corpus)
-    with open(os.path.join(path_to_save_df, "tf_idf_dict.json"), "w") as f:
-        json.dump(tf_idf_dict, f)
+    # with open(os.path.join(path_to_save_df, "tf_idf_dict.json"), "w") as f:
+    #     json.dump(tf_idf_dict, f)
 
 if os.path.exists(os.path.join(path_to_save_df, "idf_dict.json")):
     print("Loading the precomputed IDF dictionary...")
@@ -174,7 +220,7 @@ else:
 
 if os.path.exists(os.path.join(path_to_save_df, "vocab.pkl")):
     print("Loading the vocabulary...")
-    vocab = pd.read_pickle(os.path.join(path_to_save_df, "vocab.pkl"))
+    # vocab = pd.read_pickle(os.path.join(path_to_save_df, "vocab.pkl"))
 else:
     print("Building the vocabulary...")
     all_words = set()
@@ -219,44 +265,39 @@ train_query["preprocessed_query"] = train_query["query"].apply(preprocess)
 # Rank Documents for Each Query using Cosine Similarity
 print("Ranking documents for each query using cosine similarity...")
 
-batch_size = 100  # Tune this based on available memory
+# Define the number of dimensions for PCA
+pca_components = 256  # Set based on memory capacity and experimentation
 
-doc_vectors_csr = doc_vectors.tocsr()
+# Perform Truncated SVD (PCA for sparse matrices) on the document vectors
+print("Reducing dimensionality with Truncated SVD...")
+svd = TruncatedSVD(n_components=pca_components)
+doc_vectors_reduced = svd.fit_transform(doc_vectors)
 
-ranked_documents_dict = {}
-true_labels = []
-predicted_labels = []
+# Normalize the reduced document vectors
+print("Normalizing the reduced document vectors...")
+doc_vectors_reduced = doc_vectors_reduced.astype(np.float32)
+faiss.normalize_L2(doc_vectors_reduced)
 
-for i in tqdm(range(0, len(train_query), batch_size), desc="Batch processing queries"):
-    batch_queries = train_query.iloc[i:i+batch_size]
-    batch_query_ids = batch_queries["query_id"]
-    batch_query_vectors = [sparse_vectorize_query(query, tf_idf_dict, vocab) for query in batch_queries["preprocessed_query"]]
+# Initialize FAISS index with reduced dimensions
+index = faiss.IndexFlatIP(pca_components)
+index.add(doc_vectors_reduced)
 
-    batch_query_matrix = vstack(batch_query_vectors)
+# Run the FAISS-based ranking
+print("Ranking documents using FAISS ANN with reduced dimensions...")
+ranked_documents_dict, true_labels, predicted_labels = rank_documents_with_faiss(
+    train_query, svd, index
+)
 
-    # Convert to cupy arrays for GPU computation
-    batch_query_matrix_gpu = cp.sparse.csr_matrix(batch_query_matrix)
-    doc_vectors_gpu = cp.sparse.csr_matrix(doc_vectors_csr)
-
-    # Compute cosine similarities on GPU
-    batch_similarities_gpu = batch_query_matrix_gpu.dot(doc_vectors_gpu.T).toarray()
-    batch_similarities = cp.asnumpy(batch_similarities_gpu)
-
-    for j, query_id in enumerate(batch_query_ids):
-        similarities = batch_similarities[j].flatten()
-        top_doc_indices = np.argsort(similarities)[-10:][::-1]
-        
-        ranked_documents_dict[query_id] = top_doc_indices
-        true_labels.append(train_query.loc[train_query["query_id"] == query_id, "positive_docs"].values[0])
-        predicted_labels.append(top_doc_indices)
-
+# Save and evaluate the results
 ranked_documents_df = pd.DataFrame(ranked_documents_dict).T
 ranked_documents_df.columns = [f"doc_{i}" for i in range(1, 11)]
 ranked_documents_df.index.name = "query_id"
-ranked_documents_df.to_csv(os.path.join(path_to_save_df, "ranked_documents.csv"))
+ranked_documents_df.to_csv(os.path.join(path_to_save_df, "ranked_documents_faiss.csv"))
 
-print("Ranking completed. The ranked documents are saved as 'ranked_documents.csv'.")
+print(
+    "Ranking completed. The ranked documents are saved as 'ranked_documents_faiss.csv'."
+)
 
-print("Calculating F1 score...")
+# Calculate F1 score or any other metric as needed
 f1 = f1_score(true_labels, predicted_labels, average="macro")
 print(f"F1 Score: {f1}")
