@@ -185,93 +185,66 @@ def compute_idf(df_dict, num_docs):
     }
     return idf_dict
 
+
+
+
+
+
 # Function to preprocess and rank using cosine similarity
-def rank_documents_with_cosine_similarity(
-    corpus, train_query, tf_dict, idf_dict, batch_size=400
-):
+# BM25 Scoring
+def bm25_score(query_terms, doc_id, tf_dict, idf_dict, avgdl, k1=1.5, b=0.75):
+    score = 0
+    doc_length = sum(tf_dict.get(term, {}).get(doc_id, 0) for term in query_terms)
+    for term in query_terms:
+        if term in tf_dict:
+            term_tf = tf_dict[term].get(doc_id, 0)
+            term_idf = idf_dict.get(term, 0)
+            numerator = term_tf * (k1 + 1)
+            denominator = term_tf + k1 * (1 - b + b * (doc_length / avgdl))
+            score += term_idf * (numerator / denominator)
+    return score
+
+# Rank documents with cosine similarity, then BM25
+def rank_documents_with_cosine_similarity_and_bm25(corpus, train_query, tf_dict, idf_dict, avgdl, batch_size=400):
     term_index = {term: idx for idx, term in enumerate(tf_dict.keys())}
 
     if os.path.exists(path_to_saved_file + "embeddings.npz"):
-        print("Loading embeddings from memory-mapped file...")
         embeddings = load_embeddings_from_mmap(path_to_saved_file + "embeddings.npz")
-        # load the doc_ids
         with open(path_to_saved_file + "doc_ids.pkl", "rb") as f:
             doc_ids = pickle.load(f)
-        embeddings_shape = embeddings.shape
     else:
-        print("Loading embeddings from pickle file...")
         with open(path_to_saved_file + "embeddings.pkl", "rb") as f:
             embeddings = pickle.load(f)
         save_embeddings_to_mmap(embeddings, path_to_saved_file + "embeddings.npy")
-        embeddings_shape = embeddings.shape
 
-    # Normalize document embeddings
-    doc_norms = norm(embeddings, axis=1)  # Shape will be (n_documents,)
-    doc_norms = doc_norms.reshape(-1, 1)  # Reshape to (n_documents, 1)
+    doc_norms = norm(embeddings, axis=1).reshape(-1, 1)
     normalized_embeddings = embeddings.multiply(1 / doc_norms)
 
     ranked_documents_dict = {}
-
-    # Process queries in batches
     num_queries = len(train_query)
+
     for start in tqdm(range(0, num_queries, batch_size), desc="Ranking queries"):
         end = min(start + batch_size, num_queries)
         batch_queries = train_query[["query_id", "preprocessed_query"]].values[start:end]
-
-        # Generate embeddings for the entire batch
         batch_query_embeddings = []
-        for query_id, query_text in batch_queries:
-            query_embedding = generate_query_embedding(
-                query_text, tf_dict, idf_dict, term_index
-            )
-            query_embedding = query_embedding.tocsr()
-
-            # Normalize query embedding
+        for _, query_text in batch_queries:
+            query_embedding = generate_query_embedding(query_text, tf_dict, idf_dict, term_index)
             query_norm = norm(query_embedding)
-            query_embedding = query_embedding.multiply(1 / query_norm)
+            batch_query_embeddings.append(query_embedding.multiply(1 / query_norm))
 
-            batch_query_embeddings.append(query_embedding)
-
-        # Convert batch_query_embeddings to a sparse matrix
         batch_query_embeddings = csr_matrix(vstack(batch_query_embeddings))
-
-        # Compute cosine similarities using sparse matrix multiplication
-        #print("Computing cosine similarities...")
-        cosine_similarities = normalized_embeddings.dot(
-            batch_query_embeddings.T
-        ).toarray()
+        cosine_similarities = normalized_embeddings.dot(batch_query_embeddings.T).toarray()
         
-        with open(path_to_save_df + "corpus_lang.pkl", "rb") as f:
-            corpus_lang = pickle.load(f)
-        
-        query_lang_dict = {query_id: lang for query_id, lang in train_query[["query_id", "lang"]].values}
-        doc_lang_dict = {doc_id: lang for doc_id, lang in corpus_lang.items()}
-        
-        
-        # Rank documents based on cosine similarity
         for i, (query_id, query_text) in enumerate(batch_queries):
-            query_lang = query_lang_dict[query_id]  # Assuming you have a dictionary of query languages
-            top_indices = np.argsort(cosine_similarities[:, i])[::-1]
-            
-            # Filter top indices by language
-            filtered_top_indices = []  
-            for idx in top_indices:
-                doc_id = doc_ids[idx]
-                doc_lang = doc_lang_dict[doc_id]
-                
-                if doc_lang == query_lang:
-                    filtered_top_indices.append(idx)
-                    
-                if len(filtered_top_indices) == 100:
-                    break
-            
-            ranked_documents_dict[query_id] = [doc_ids[idx] for idx in filtered_top_indices]
-            
-        # Rank the top 100 documents with another ranking system to get the top 10 documents from it
-        # This is to ensure that the top 10 documents are the most relevant to the query
-        
-        
-        
+            top_indices = np.argsort(cosine_similarities[:, i])[::-1][:50]
+            query_terms = query_text.split()
+
+            top_100_docs = [(doc_ids[idx], bm25_score(query_terms, doc_ids[idx], tf_dict, idf_dict, avgdl))
+                            for idx in top_indices]
+            top_10_bm25 = sorted(top_100_docs, key=lambda x: x[1], reverse=True)[:10]
+
+            ranked_documents_dict[query_id] = [doc[0] for doc in top_10_bm25]
+
     return ranked_documents_dict
 
 
@@ -354,7 +327,7 @@ if __name__ == "__main__":
         # )
     else:
         print("Loading and preprocessing queries...")
-        train_query_df = load_and_preprocess_queries(path_to_train_query)
+        #train_query_df = load_and_preprocess_queries(path_to_train_query)
 
     # Load or compute TF, DF, avgdl, and IDF
     if os.path.exists(path_to_saved_file + "tf_dict.pkl") and os.path.exists(
@@ -406,8 +379,11 @@ if __name__ == "__main__":
 
     # Preprocess the test queries
     test_query_df = load_and_preprocess_queries(path_to_test_query)
+    
 
-    ranked_docs = rank_documents_with_cosine_similarity(corpus_df, test_query_df, tf_dict, idf_dict)
+    ranked_docs = rank_documents_with_cosine_similarity_and_bm25(corpus_df, test_query_df, tf_dict, idf_dict, avgdl)
+    
+    
 
     # Make a CSV with query_id and all the doc_ids in an array
     ranked_docs_df = pd.DataFrame(ranked_docs.items(), columns=["query_id", "docids"])

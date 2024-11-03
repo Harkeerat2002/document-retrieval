@@ -16,6 +16,7 @@ from nltk.corpus import stopwords
 from ko_ww_stopwords.stop_words import ko_ww_stop_words
 from nltk.stem import PorterStemmer
 from sklearn.decomposition import TruncatedSVD
+from sklearn.decomposition import IncrementalPCA
 tqdm.pandas()
 
 # Constants and paths
@@ -137,7 +138,7 @@ def create_tfidf_embedding(corpus, tf_dict, idf_dict, term_index):
         embeddings.append(embedding)
         doc_ids.append(doc_id)
 
-    return vstack(embeddings), doc_ids
+    return vstack(embeddings),
 
 # Save embeddings to memory-mapped file
 def save_embeddings_to_mmap(embeddings, mmap_file):
@@ -154,27 +155,54 @@ def generate_query_embedding(query_text, tf_dict, idf_dict, term_index):
             query_embedding[0, term_index[term]] = idf_dict.get(term, 0)
     return query_embedding
 
-# BM25 score calculation
-def bm25_score(query, doc_id, tf_dict, idf_dict, doc_len, avgdl):
+def init_worker(tf_dict_shared, idf_dict_shared, avgdl_shared):
+    global tf_dict
+    global idf_dict
+    global avgdl
+    tf_dict = tf_dict_shared
+    idf_dict = idf_dict_shared
+    avgdl = avgdl_shared
+
+def bm25_worker(args):
+    query_terms, doc_id, doc_len = args
+    return doc_id, bm25_score(query_terms, doc_id, doc_len)
+
+# Modify the bm25_score function to use global variables
+def bm25_score(query_terms, doc_id, doc_len):
     score = 0.0
-    for term in query.split():
+    print("doc_id", doc_id)
+    for term in query_terms:
         if term in idf_dict:
             idf = idf_dict[term]
             f_td = tf_dict.get(term, {}).get(doc_id, 0)
-            term_score = idf * ((f_td * (k1 + 1)) / (f_td + k1 * (1 - b + b * (doc_len / avgdl))))
-            score += term_score
+            denom = f_td + k1 * (1 - b + b * (doc_len / avgdl))
+            if denom != 0:
+                term_score = idf * ((f_td * (k1 + 1)) / denom)
+                score += term_score
     return score
 
-# Rank documents using BM25
+# In the rank_documents_with_bm25 function, use initializer and initargs
 def rank_documents_with_bm25(corpus, queries, tf_dict, idf_dict, avgdl, top_k=10):
     ranked_documents = {}
+    doc_ids = corpus["docid"].values
+    doc_lens = corpus["doc_len"].values
+    n_jobs = cpu_count()
 
-    for query_id, query_text in tqdm(queries[["id", "preprocessed_query"]].values, desc="Ranking queries with BM25"):
-        query_scores = {doc_id: bm25_score(query_text, doc_id, tf_dict, idf_dict, doc_len, avgdl)
-                        for doc_id, doc_len in zip(corpus["docid"], corpus["doc_len"])}
-        
-        top_docs = sorted(query_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
-        ranked_documents[query_id] = [doc_id for doc_id, _ in top_docs]
+    print("Ranking documents with BM25...")
+    # Use initializer and initargs to pass shared variables
+    with Pool(processes=n_jobs, initializer=init_worker, initargs=(tf_dict, idf_dict, avgdl)) as pool:
+        with tqdm(total=len(queries), desc="Ranking queries with BM25") as pbar:
+            for query_id, query_text in queries[["id", "preprocessed_query"]].values:
+                query_terms = query_text.split()
+                args_list = [(query_terms, doc_id, doc_len) for doc_id, doc_len in zip(doc_ids, doc_lens)]
+
+                results = pool.map(bm25_worker, args_list)
+
+                query_scores = dict(results)
+                top_docs = sorted(query_scores.items(), key=lambda x: x[1], reverse=True)[:top_k]
+                ranked_documents[query_id] = [doc_id for doc_id, _ in top_docs]
+                
+                pbar.update(1)
 
     return ranked_documents
 
@@ -182,7 +210,11 @@ def rank_documents_with_bm25(corpus, queries, tf_dict, idf_dict, avgdl, top_k=10
 def reduce_dimensions(embeddings, n_components=300):
     print("Reducing dimensionality of embeddings with TruncatedSVD...")
     svd = TruncatedSVD(n_components=n_components)
+    
+    print("Fitting TruncatedSVD...")
+    # Fit and transform the sparse matrix directly
     reduced_embeddings = svd.fit_transform(embeddings)
+    
     print(f"Reduced embeddings to {n_components} dimensions.")
     return reduced_embeddings
 
@@ -235,23 +267,34 @@ if __name__ == "__main__":
             pickle.dump(idf_dict, f)
 
     # Create term index and embeddings
-    term_index = {term: idx for idx, term in enumerate(df_dict.keys())}
-    embeddings, doc_ids = create_tfidf_embedding(corpus_df, tf_dict, idf_dict, term_index)
+         # Save the Embeddings to a memory-mapped file
+    # Check if embeddings are already saved
+    if os.path.exists(os.path.join(path_save_emb, "tfidf_embeddings_before_pca.npz")):
+        print("Loading precomputed embeddings...")
+        embeddings = load_embeddings_from_mmap(os.path.join(path_save_emb, "tfidf_embeddings_before_pca.npz"))
+    else:
+        print("Creating TF-IDF embeddings...")
+        term_index = {term: idx for idx, term in enumerate(df_dict.keys())}
+        embeddings, doc_ids = create_tfidf_embedding(corpus_df, tf_dict, idf_dict, term_index)
+        mmap_file = os.path.join(path_save_emb, "tfidf_embeddings_before_pca.npz")
+        save_embeddings_to_mmap(embeddings, mmap_file)
     
-    # Save the Embeddings to a memory-mapped file
-    mmap_file = os.path.join(path_save_emb, "tfidf_embeddings_before_pca.npz")
-    save_embeddings_to_mmap(embeddings, mmap_file)
+   
 
-    # Dimensionality reduction with PCA
-    embeddings = reduce_dimensions(embeddings)
+    # # Dimensionality reduction with PCA
+    # embeddings = reduce_dimensions(embeddings)
 
-    # Save embeddings to a memory-mapped file
-    mmap_file = os.path.join(path_save_emb, "tfidf_embeddings.npz")
-    save_embeddings_to_mmap(embeddings, mmap_file)
+    # # Save embeddings to a memory-mapped file
+    # mmap_file = os.path.join(path_save_emb, "tfidf_embeddings.npz")
+    # save_embeddings_to_mmap(embeddings, mmap_file)
 
-    # Load memory-mapped embeddings and rank with BM25
-    embeddings = load_embeddings_from_mmap(mmap_file)
-    ranked_docs = rank_documents_with_bm25(corpus_df, train_query_df, tf_dict, idf_dict, avgdl, top_k=10)
+    # # Load memory-mapped embeddings and rank with BM25
+    # embeddings = load_embeddings_from_mmap(mmap_file)
+    
+     # Preprocess the test queries
+    path_to_test_query = "./data/test.csv"
+    test_query_df = load_and_preprocess_queries(path_to_test_query) 
+    ranked_docs = rank_documents_with_bm25(corpus_df, test_query_df, tf_dict, idf_dict, avgdl, top_k=10)
 
     # Display the ranked documents for each query
     for query_id, docs in ranked_docs.items():

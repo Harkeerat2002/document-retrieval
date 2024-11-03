@@ -14,6 +14,11 @@ from nltk.corpus import stopwords
 from ko_ww_stopwords.stop_words import ko_ww_stop_words
 from nltk.stem import PorterStemmer
 import string
+from bs4 import BeautifulSoup
+import re
+from contractions import fix
+from nltk.stem import WordNetLemmatizer
+
 
 # Paths
 path_to_save_df = "./data/pd_df_v2/"
@@ -37,6 +42,8 @@ stop_words_dict["ko"] = korean_stop_words
 
 stemmer = PorterStemmer()
 
+lemmatizer = WordNetLemmatizer()
+
 # Create path_to_save_df if it does not exist
 if not os.path.exists(path_to_save_df):
     os.makedirs(path_to_save_df)
@@ -44,27 +51,24 @@ if not os.path.exists(path_to_save_df):
 
 # Helper function to preprocess text
 def preprocess(text, lan):
-    # print("Before Preprocessing: ", len(text), docid)
-    # Lowercasing and removing punctuation using pandas vectorized operations
-    text = (
-        pd.Series(text)
-        .str.lower()
-        .str.replace(f"[{string.punctuation}]", " ", regex=True)
-        .iloc[0]
-    )
-
-    # Remove Stopwords without tokenization
+    # Lowercasing
+    text = text.lower()
+    # Remove HTML tags
+    text = BeautifulSoup(text, "html.parser").get_text()
+    # Expand contractions
+    text = fix(text)
+    # Remove URLs
+    text = re.sub(r"http\S+|www\S+|https\S+", '', text, flags=re.MULTILINE)
+    # Remove punctuation
+    text = text.translate(str.maketrans('', '', string.punctuation))
+    # Remove numbers
+    text = re.sub(r'\d+', '', text)
+    # Remove stopwords
     text = " ".join([word for word in text.split() if word not in stop_words_dict[lan]])
-
-    # Stemming
-    for word in text.split():
-        text = text.replace(word, stemmer.stem(word))
-
-    # Extra whitespace removal
-    for _ in range(10):
-        text = text.replace("  ", " ")
-
-    # print("After Preprocessing: ", len(text), docid)
+    # Lemmatization
+    text = " ".join([lemmatizer.lemmatize(word) for word in text.split()])
+    # Remove extra whitespaces
+    text = " ".join(text.split())
 
     return text
 
@@ -118,7 +122,6 @@ def save_embeddings_to_mmap(embeddings, mmap_file):
 def load_embeddings_from_mmap(mmap_file):
     return load_npz(mmap_file).tocsr()
 
-
 def generate_query_embedding(query_text, tf_dict, idf_dict, term_index):
     query_embedding = lil_matrix((1, len(term_index)), dtype=np.float32)
     for term in query_text.split():
@@ -128,50 +131,37 @@ def generate_query_embedding(query_text, tf_dict, idf_dict, term_index):
 
 # Compute TF, DF, and average document length
 def compute_tf_df_and_avgdl(corpus_df, path_to_saved_file):
-    # Structure of tf_dict: {term: {doc_id: tf}}
-    # Structure of df_dict: {term: df}
+    # Initialize data structures
+    tf_dict = defaultdict(Counter)
+    df_dict = defaultdict(int)
+    num_docs = len(corpus_df)
+    total_doc_length = 0
 
-    # Initialize dictionaries to hold term frequencies and document frequencies
-    tf_dict = defaultdict(lambda: defaultdict(int))  # {term: {doc_id: tf}}
-    df_dict = defaultdict(int)  # {term: df}
-    total_length = 0  # To calculate average document length
-    num_docs = len(corpus_df)  # Total number of documents
-
-    # Iterate through each document in the corpus
-    for doc_id, row in tqdm(
-        corpus_df.iterrows(), desc="Computing TF, DF, and avgdl", total=num_docs
+    # Process each document in the corpus
+    for doc_id, text in tqdm(
+        corpus_df[["docid", "preprocessed_text"]].values,
+        desc="Computing TF, DF, and average document length",
     ):
-        doc_id = row["docid"]  # Get the document ID
-        text = row["preprocessed_text"]  # Get the preprocessed text of the document
-        words = text.split()  # Split the text into words
-        total_length += len(words)  # Update total word count
-        unique_words = set(words)  # Get unique words in the document
+        terms = text.split()
+        doc_length = len(terms)
+        total_doc_length += doc_length
 
-        # Update term frequencies in tf_dict
-        for word in words:
-            tf_dict[word][
-                doc_id
-            ] += 1  # Increment term frequency for this word in the document
+        # Compute term frequencies and document frequencies
+        term_freqs = Counter(terms)
+        for term, freq in term_freqs.items():
+            tf_dict[doc_id][term] = freq
+            df_dict[term] += 1
 
-        # Update document frequencies in df_dict
-        for word in unique_words:
-            df_dict[word] += 1  # Increment document frequency for the unique word
+    # Compute average document length
+    avgdl = total_doc_length / num_docs
 
-    avgdl = total_length / num_docs  # Calculate average document length
-
-    # Convert tf_dict to standard dictionary for serialization
-    tf_dict = {k: dict(v) for k, v in tf_dict.items()}  # Convert defaultdict to dict
-    df_dict = dict(df_dict)  # Convert defaultdict to dict
-
-    # Save the dictionaries and average document length to files
+    # Save TF and DF dictionaries
     with open(path_to_saved_file + "tf_dict.pkl", "wb") as f:
         pickle.dump(tf_dict, f)
     with open(path_to_saved_file + "df_dict.pkl", "wb") as f:
         pickle.dump(df_dict, f)
     with open(path_to_saved_file + "avgdl.pkl", "wb") as f:
         pickle.dump(avgdl, f)
-    with open(path_to_saved_file + "num_docs.pkl", "wb") as f:
-        pickle.dump(num_docs, f)
 
     return tf_dict, df_dict, avgdl, num_docs
 
@@ -185,9 +175,34 @@ def compute_idf(df_dict, num_docs):
     }
     return idf_dict
 
+def compute_bm25_score(query, doc_id, tf_dict, idf_dict, avgdl, k1=1.5, b=0.75):
+    score = 0.0
+    doc_len = sum(tf_dict[doc_id].values())
+    for term in query.split():
+        if term in tf_dict[doc_id]:
+            tf = tf_dict[doc_id][term]
+            idf = idf_dict.get(term, 0)
+            numerator = idf * tf * (k1 + 1)
+            denominator = tf + k1 * (1 - b + b * (doc_len / avgdl))
+            score += numerator / denominator
+    return score
+
+def bm25_rerank(corpus, current_ranked_docs, queries, td_dict, idf_dict, avgdl, top_k=10):
+    reranked_docs = {}
+    for query_id, query, in tqdm(queries[["query_id", "preprocessed_query"]].values, desc="Reranking queries"):
+        scores = []
+        for doc_id in current_ranked_docs[query_id]:
+            score = (compute_bm25_score(query, doc_id, td_dict, idf_dict, avgdl))
+            scores.append((doc_id, score))
+        top_indices = [doc_id for doc_id, _ in sorted(scores, key=lambda x: x[1], reverse=True)[:top_k]]
+        reranked_docs[query_id] = top_indices
+        
+    return reranked_docs
+    
+
 # Function to preprocess and rank using cosine similarity
 def rank_documents_with_cosine_similarity(
-    corpus, train_query, tf_dict, idf_dict, batch_size=400
+    corpus, train_query, tf_dict, idf_dict, avgdl, batch_size=400
 ):
     term_index = {term: idx for idx, term in enumerate(tf_dict.keys())}
 
@@ -195,13 +210,12 @@ def rank_documents_with_cosine_similarity(
         print("Loading embeddings from memory-mapped file...")
         embeddings = load_embeddings_from_mmap(path_to_saved_file + "embeddings.npz")
         # load the doc_ids
-        with open(path_to_saved_file + "doc_ids.pkl", "rb") as f:
-            doc_ids = pickle.load(f)
+        doc_ids = corpus["docid"].values
         embeddings_shape = embeddings.shape
     else:
         print("Loading embeddings from pickle file...")
-        with open(path_to_saved_file + "embeddings.pkl", "rb") as f:
-            embeddings = pickle.load(f)
+        embeddings, doc_ids= create_tfidf_embedding(corpus, tf_dict, idf_dict, term_index)
+        
         save_embeddings_to_mmap(embeddings, path_to_saved_file + "embeddings.npy")
         embeddings_shape = embeddings.shape
 
@@ -241,8 +255,14 @@ def rank_documents_with_cosine_similarity(
             batch_query_embeddings.T
         ).toarray()
         
+        # Calulate the similarities with the Manhattan Distance:
+        # manhattan_similarities = np.abs(normalized_embeddings.dot(
+        #     batch_query_embeddings.T
+        # ).toarray())
+        
         with open(path_to_save_df + "corpus_lang.pkl", "rb") as f:
             corpus_lang = pickle.load(f)
+            
         
         query_lang_dict = {query_id: lang for query_id, lang in train_query[["query_id", "lang"]].values}
         doc_lang_dict = {doc_id: lang for doc_id, lang in corpus_lang.items()}
@@ -262,16 +282,18 @@ def rank_documents_with_cosine_similarity(
                 if doc_lang == query_lang:
                     filtered_top_indices.append(idx)
                     
-                if len(filtered_top_indices) == 100:
+                if len(filtered_top_indices) == 10:
                     break
             
             ranked_documents_dict[query_id] = [doc_ids[idx] for idx in filtered_top_indices]
             
-        # Rank the top 100 documents with another ranking system to get the top 10 documents from it
-        # This is to ensure that the top 10 documents are the most relevant to the query
-        
-        
-        
+    # Reranking the top 100 documents with bm25 score to get the top 10 using the library bm250
+    
+    # reranked_documents = bm25_rerank(corpus, ranked_documents_dict, train_query, tf_dict, idf_dict, avgdl)
+            
+    
+    # # print(reranked_documents[0])
+    
     return ranked_documents_dict
 
 
@@ -354,7 +376,7 @@ if __name__ == "__main__":
         # )
     else:
         print("Loading and preprocessing queries...")
-        train_query_df = load_and_preprocess_queries(path_to_train_query)
+        #train_query_df = load_and_preprocess_queries(path_to_train_query)
 
     # Load or compute TF, DF, avgdl, and IDF
     if os.path.exists(path_to_saved_file + "tf_dict.pkl") and os.path.exists(
@@ -364,9 +386,11 @@ if __name__ == "__main__":
         with open(path_to_saved_file + "tf_dict.pkl", "rb") as f:
             tf_dict = pickle.load(f)
         with open(path_to_saved_file + "df_dict.pkl", "rb") as f:
-            df_dict = pickle.load(f)
+            #df_dict = pickle.load(f)
+            pass
         with open(path_to_saved_file + "avgdl.pkl", "rb") as f:
             avgdl = pickle.load(f)
+            
     else:
         print("Computing TF and DF dictionaries...")
         tf_dict, df_dict, avgdl, num_docs = compute_tf_df_and_avgdl(
@@ -386,13 +410,13 @@ if __name__ == "__main__":
             pickle.dump(idf_dict, f)
 
     # Compute the term index
-    term_index = {term: idx for idx, term in enumerate(tf_dict.keys())}
+    # term_index = {term: idx for idx, term in enumerate(tf_dict.keys())}
     # freq = 50
     # term_index = {term: idx for term, idx in term_index.items() if df_dict[term] > freq}
     # term_index = {term: idx for idx, term in enumerate(term_index.keys())}
 
-    del df_dict
-    gc.collect()
+    # del df_dict
+    # gc.collect()
 
     # Rank documents using FAISS
     print("Ranking documents using Cosine Similarity...")
@@ -407,7 +431,7 @@ if __name__ == "__main__":
     # Preprocess the test queries
     test_query_df = load_and_preprocess_queries(path_to_test_query)
 
-    ranked_docs = rank_documents_with_cosine_similarity(corpus_df, test_query_df, tf_dict, idf_dict)
+    ranked_docs = rank_documents_with_cosine_similarity(corpus_df, test_query_df, tf_dict, idf_dict, avgdl)
 
     # Make a CSV with query_id and all the doc_ids in an array
     ranked_docs_df = pd.DataFrame(ranked_docs.items(), columns=["query_id", "docids"])
@@ -417,7 +441,7 @@ if __name__ == "__main__":
     pos_do = 0
     
     for i in range(len(ranked_docs_df)):
-        if possitive_docs[i] in ranked_docs_df["docids"][i]:
+        if possitive_docs[i] in ranked_docs_df.loc[i, "docids"]:
             pos_do += 1
             
             

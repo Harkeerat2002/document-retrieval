@@ -2,7 +2,7 @@ import csv
 import collections
 
 # Open the submission file
-path = "data/pd_df/submission.csv"
+path = "data/saved_files/final_results.csv"
 
 # Read the submission file
 with open(path, "r") as file:
