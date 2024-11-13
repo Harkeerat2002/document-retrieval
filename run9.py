@@ -16,6 +16,8 @@ from nltk.corpus import stopwords
 from ko_ww_stopwords.stop_words import ko_ww_stop_words
 from transformers import AutoTokenizer, AutoModel
 import multiprocessing as mp
+from collections import defaultdict, Counter
+from concurrent.futures import ThreadPoolExecutor
 
 # Download the necessary resources
 # nltk.download('wordnet')
@@ -42,7 +44,8 @@ model = AutoModel.from_pretrained(model_name)
 
 # Paths
 path_to_corpus_json = "data/corpus.json/corpus.json"
-path_to_save_files = "data/saved_files_v4/"
+path_to_save_df = "data/pd_df/"
+path_to_save_files = "data/saved_files/"
 path_to_query = "data/dev.csv"
 
 lemmatizer = WordNetLemmatizer()
@@ -116,10 +119,58 @@ def init_worker():
 
 def main():
     # Preprocess the Corpus
-    if os.path.exists(path_to_save_files + "preprocessed_corpus.pkl"):
+    if os.path.exists(path_to_save_df + "preprocessed_corpus.pkl"):
         print("Preprocessed Corpus exists, loading it")
-        with open(path_to_save_files + "preprocessed_corpus.pkl", "rb") as f:
+        with open(path_to_save_df + "preprocessed_corpus.pkl", "rb") as f:
             preprocessed_c = pickle.load(f)
+            
+        corpus = json.load(open(path_to_corpus_json))
+        
+        corpus_vocab = defaultdict(Counter)
+        pre_corpus_vocab = defaultdict(Counter)
+        doc_ids_and_lang = {}
+
+        def process_main_corpus(doc):
+            lang = doc["lang"]
+            text = doc["text"]
+            doc_id = doc["docid"]
+            doc_ids_and_lang[doc_id] = lang
+            
+            tokens = word_tokenize(text)
+            corpus_vocab[lang].update(tokens)
+
+        def process_preprocessed_corpus(doc_id):
+            lang = doc_ids_and_lang[doc_id]
+            text = preprocessed_c[doc_id]
+            
+            tokens = word_tokenize(text)
+            pre_corpus_vocab[lang].update(tokens)
+
+        # Process the main corpus in parallel
+        with ThreadPoolExecutor() as executor:
+            list(tqdm.tqdm(executor.map(process_main_corpus, corpus), total=len(corpus)))
+
+        # Process the preprocessed corpus in parallel
+        with ThreadPoolExecutor() as executor:
+            list(tqdm.tqdm(executor.map(process_preprocessed_corpus, preprocessed_c), total=len(preprocessed_c)))
+
+        # Convert defaultdict(Counter) to regular dict for final output
+        corpus_vocab = {lang: dict(counter) for lang, counter in corpus_vocab.items()}
+        pre_corpus_vocab = {lang: dict(counter) for lang, counter in pre_corpus_vocab.items()}
+
+        # Calculate corpus vocab lengths
+        corpus_vocab_length = {lang: sum(counter.values()) for lang, counter in corpus_vocab.items()}
+        pre_corpus_vocab_length = {lang: sum(counter.values()) for lang, counter in pre_corpus_vocab.items()}
+                    
+        # Print length of vocab of corpus for each lang & total for corpus before preprocessing and after preprocessing
+        for lang in corpus_vocab:
+            print(f"Lang: {lang}, Vocab Length Before Preprocessing: {corpus_vocab[lang]}, Vocab Length After Preprocessing: {corpus_vocab_length[lang]}")
+            
+        print("Total Vocab Length Before Preprocessing: ", sum(corpus_vocab.values()))   
+        print("Total Vocab Length After Preprocessing: ", sum(corpus_vocab_length.values())) 
+        
+                    
+        
     else:
         print("Preprocessing Corpus")
         preprocessed_c = preprocess_corpus()

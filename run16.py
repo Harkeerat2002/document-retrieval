@@ -14,115 +14,59 @@ from nltk.corpus import stopwords
 from ko_ww_stopwords.stop_words import ko_ww_stop_words
 from nltk.stem import PorterStemmer
 import string
-import pandas as pd
-import numpy as np
-from sklearn.model_selection import train_test_split
-import math
-from collections import defaultdict
-import pickle
-import os
-import json
-from tqdm import tqdm
-import nltk
-from konlpy.tag import Okt
-import joblib
-import string
-from nltk.stem import WordNetLemmatizer, SnowballStemmer
-from nltk.util import ngrams
-import gc
-from multiprocessing import Pool, cpu_count
 
 # Paths
-path_to_save_df = "./data/pd_df/"
-path_to_saved_file = "./data/saved_files/"
+path_to_save_df = "./data/pd_df_v2/"
+path_to_saved_file = "./data/saved_files_v2/"
 path_to_train_query = "./data/train.csv"
 corpus_file_path = "./data/corpus.json/corpus.json"
 path_save_emb = "./data/saved_files/"
 
-# nltk.download('punkt')
-# nltk.download('stopwords')
-# nltk.download('wordnet')
-
-okt = Okt()
-lemmatizer = WordNetLemmatizer()
-stemmer_dict = {
-    'fr': SnowballStemmer('french'),
-    'de': SnowballStemmer('german'),
-    'es': SnowballStemmer('spanish'),
-    'it': SnowballStemmer('italian'),
-    'en': SnowballStemmer('english')
+stop_words_dict = {
+    "en": set(stopwords.words("english")),
+    "fr": set(stopwords.words("french")),
+    "de": set(stopwords.words("german")),
+    "es": set(stopwords.words("spanish")),
+    "it": set(stopwords.words("italian")),
+    "ar": set(stopwords.words("arabic")),
 }
 
-def load_stopwords(languages=['english', 'french', 'german', 'spanish', 'italian']):
-    stop_words = set()
-    for lang in languages:
-        stop_words.update(nltk.corpus.stopwords.words(lang))
-    return stop_words
+# Stop Words Korean
+korean_stop_words = set(ko_ww_stop_words)
+stop_words_dict["ko"] = korean_stop_words
 
-stop_words = load_stopwords(['english', 'french', 'german', 'spanish', 'italian'])
+stemmer = PorterStemmer()
 
 # Create path_to_save_df if it does not exist
 if not os.path.exists(path_to_save_df):
     os.makedirs(path_to_save_df)
 
 
-def preprocess(text, lang):
-    if not isinstance(text, str):
-        text = ""
-    text = text.translate(str.maketrans('', '', string.punctuation))
-    
-    if lang in ['en', 'fr', 'de', 'es', 'it']:
-        tokens = nltk.word_tokenize(text)
-    elif lang == 'ko':
-        tokens = okt.morphs(text)
-    else:
-        tokens = text.split()
-    
-    tokens = [word for word in tokens if word.lower() not in stop_words]
-    
-    if lang == 'en':
-        tokens = [lemmatizer.lemmatize(word) for word in tokens]
-    elif lang in ['fr', 'de', 'es', 'it']:
-        stemmer = stemmer_dict.get(lang, None)
-        if stemmer:
-            tokens = [stemmer.stem(word) for word in tokens]
-    
-    if lang in ['fr', 'de', 'es', 'it'] and len(tokens) >= 2:
-        n_grams = ['_'.join(gram) for gram in ngrams(tokens, 2)]
-        tokens = tokens + n_grams
-    
-    cleaned_text = ' '.join(tokens)
-    return cleaned_text
+# Helper function to preprocess text
+def preprocess(text, lan):
+    # print("Before Preprocessing: ", len(text), docid)
+    # Lowercasing and removing punctuation using pandas vectorized operations
+    text = (
+        pd.Series(text)
+        .str.lower()
+        .str.replace(f"[{string.punctuation}]", " ", regex=True)
+        .iloc[0]
+    )
 
-# Batch processing function for corpus
-def preprocess_batch(corpus_chunk, batch_idx):
-    # tqdm within each batch for progress tracking
-    corpus_chunk["preprocessed_text"] = [
-        preprocess(text, lang) 
-        for text, lang in tqdm(corpus_chunk[["text", "lang"]].values, 
-                               desc=f"Batch {batch_idx} Preprocessing", 
-                               leave=False)
-    ]
-    corpus_chunk["doc_len"] = corpus_chunk["preprocessed_text"].apply(lambda x: len(x.split()))
-    return corpus_chunk[["docid", "preprocessed_text", "doc_len"]]
+    # Remove Stopwords without tokenization
+    text = " ".join([word for word in text.split() if word not in stop_words_dict[lan]])
 
-# Function to preprocess corpus in batches with multiprocessing and batch tracking
-def preprocess_corpus_in_batches(corpus_df, batch_size, n_jobs):
-    num_batches = len(corpus_df) // batch_size + (1 if len(corpus_df) % batch_size != 0 else 0)
-    processed_batches = []
+    # Stemming
+    for word in text.split():
+        text = text.replace(word, stemmer.stem(word))
 
-    with Pool(processes=n_jobs) as pool:
-        for i in tqdm(range(num_batches), desc="Processing batches"):
-            start_idx = i * batch_size
-            end_idx = min((i + 1) * batch_size, len(corpus_df))
-            corpus_chunk = corpus_df.iloc[start_idx:end_idx]
-            # Track batch processing
-            processed_batches.append(pool.apply_async(preprocess_batch, (corpus_chunk, i)))
+    # Extra whitespace removal
+    for _ in range(10):
+        text = text.replace("  ", " ")
 
-        # Gather results from parallel processes
-        processed_corpus = pd.concat([batch.get() for batch in processed_batches], ignore_index=True)
+    # print("After Preprocessing: ", len(text), docid)
 
-    return processed_corpus
+    return text
 
 
 # Manually create TF-IDF embeddings
@@ -184,27 +128,42 @@ def generate_query_embedding(query_text, tf_dict, idf_dict, term_index):
 
 # Compute TF, DF, and average document length
 def compute_tf_df_and_avgdl(corpus_df, path_to_saved_file):
-    tf_dict = defaultdict(lambda: defaultdict(int))
-    df_dict = defaultdict(int)
-    total_length = 0
-    num_docs = len(corpus_df)
+    # Structure of tf_dict: {term: {doc_id: tf}}
+    # Structure of df_dict: {term: df}
 
-    for doc_id, row in tqdm(corpus_df.iterrows(), desc="Computing TF, DF, and avgdl", total=num_docs):
-        doc_id = row["docid"]
-        text = row["preprocessed_text"]
-        words = text.split()
-        total_length += len(words)
-        unique_words = set(words)
+    # Initialize dictionaries to hold term frequencies and document frequencies
+    tf_dict = defaultdict(lambda: defaultdict(int))  # {term: {doc_id: tf}}
+    df_dict = defaultdict(int)  # {term: df}
+    total_length = 0  # To calculate average document length
+    num_docs = len(corpus_df)  # Total number of documents
 
+    # Iterate through each document in the corpus
+    for doc_id, row in tqdm(
+        corpus_df.iterrows(), desc="Computing TF, DF, and avgdl", total=num_docs
+    ):
+        doc_id = row["docid"]  # Get the document ID
+        text = row["preprocessed_text"]  # Get the preprocessed text of the document
+        words = text.split()  # Split the text into words
+        total_length += len(words)  # Update total word count
+        unique_words = set(words)  # Get unique words in the document
+
+        # Update term frequencies in tf_dict
         for word in words:
-            tf_dict[word][doc_id] += 1
+            tf_dict[word][
+                doc_id
+            ] += 1  # Increment term frequency for this word in the document
 
+        # Update document frequencies in df_dict
         for word in unique_words:
-            df_dict[word] += 1
+            df_dict[word] += 1  # Increment document frequency for the unique word
 
-    avgdl = total_length / num_docs
-    tf_dict, df_dict = dict(tf_dict), dict(df_dict)
+    avgdl = total_length / num_docs  # Calculate average document length
 
+    # Convert tf_dict to standard dictionary for serialization
+    tf_dict = {k: dict(v) for k, v in tf_dict.items()}  # Convert defaultdict to dict
+    df_dict = dict(df_dict)  # Convert defaultdict to dict
+
+    # Save the dictionaries and average document length to files
     with open(path_to_saved_file + "tf_dict.pkl", "wb") as f:
         pickle.dump(tf_dict, f)
     with open(path_to_saved_file + "df_dict.pkl", "wb") as f:
@@ -254,10 +213,9 @@ def rank_documents_with_cosine_similarity_and_bm25(corpus, train_query, tf_dict,
         with open(path_to_saved_file + "doc_ids.pkl", "rb") as f:
             doc_ids = pickle.load(f)
     else:
-        embeddings, doc_ids = create_tfidf_embedding(corpus, tf_dict, idf_dict, term_index)
-        save_embeddings_to_mmap(embeddings, path_to_saved_file + "embeddings.npz")
-        with open(path_to_saved_file + "doc_ids.pkl", "wb") as f:
-            pickle.dump(doc_ids, f)
+        with open(path_to_saved_file + "embeddings.pkl", "rb") as f:
+            embeddings = pickle.load(f)
+        save_embeddings_to_mmap(embeddings, path_to_saved_file + "embeddings.npy")
 
     doc_norms = norm(embeddings, axis=1).reshape(-1, 1)
     normalized_embeddings = embeddings.multiply(1 / doc_norms)
@@ -277,15 +235,18 @@ def rank_documents_with_cosine_similarity_and_bm25(corpus, train_query, tf_dict,
         batch_query_embeddings = csr_matrix(vstack(batch_query_embeddings))
         cosine_similarities = normalized_embeddings.dot(batch_query_embeddings.T).toarray()
         
+        scores = [
+                bm25_score(query_terms, doc_id, tf_dict, idf_dict, avgdl)
+                for doc_id in tqdm(doc_ids, desc="Scoring documents")
+            ]
+        
         for i, (query_id, query_text) in enumerate(batch_queries):
-            top_indices = np.argsort(cosine_similarities[:, i])[::-1][:200]
+            # Perform Ranking with BM25
             query_terms = query_text.split()
-
-            top_100_docs = [(doc_ids[idx], bm25_score(query_terms, doc_ids[idx], tf_dict, idf_dict, avgdl))
-                            for idx in top_indices]
-            top_10_bm25 = sorted(top_100_docs, key=lambda x: x[1], reverse=True)[:10]
-
-            ranked_documents_dict[query_id] = [doc[0] for doc in top_10_bm25]
+            
+            doc_scores = list(zip(doc_ids, scores))
+            doc_scores.sort(key=lambda x: x[1], reverse=True)[:10]
+            ranked_documents_dict[query_id] = [doc_id for doc_id, _ in doc_scores]
 
     return ranked_documents_dict
 
@@ -300,6 +261,34 @@ def load_and_preprocess_queries(path_to_train_query):
         )
     return train_query
 
+def process_batch(batch_df, path_to_save_df, batch_index, id, query_text, preprocessed_, file_name):
+    preprocessed_data = Parallel(n_jobs=-1)(
+        delayed(lambda row: (row[id], preprocess(row[query_text], row["lang"])))(row)
+        for _, row in tqdm(batch_df.iterrows(), total=len(batch_df))
+    )
+    preprocessed_text_df = pd.DataFrame(preprocessed_data, columns=[id, preprocessed_])
+    batch_file_path = os.path.join(path_to_save_df, f"{file_name}{batch_index}.pkl")
+    preprocessed_text_df.to_pickle(batch_file_path)
+    print(f"Batch {batch_index} saved.")
+
+# Load and preprocess corpus
+def load_and_preprocess_corpus(corpus_file_path):
+    corpus = pd.read_json(corpus_file_path)
+    batch_size = 10000
+    num_batches = len(corpus) // batch_size + 1
+    for i in range(num_batches):
+        batch_df = corpus.iloc[i * batch_size:(i + 1) * batch_size]
+        process_batch(batch_df, path_to_save_df, i, "docid", "text", "preprocessed_text", "preprocessed_corpus")
+    preprocessed_corpus = []
+    for i in range(num_batches):
+        batch_file_path = os.path.join(path_to_save_df, f"preprocessed_corpus{i}.pkl")
+        preprocessed_corpus.append(pd.read_pickle(batch_file_path))
+    
+    preprocessed_corpus = pd.concat(preprocessed_corpus, ignore_index=True)
+    preprocessed_corpus.to_pickle(os.path.join(path_to_save_df, "preprocessed_corpus.pkl"))
+    return preprocessed_corpus
+
+
 
 # Execution Flow
 if __name__ == "__main__":
@@ -309,19 +298,27 @@ if __name__ == "__main__":
             
     # print(corpus_lang)
     # exit()
-    BATCH_SIZE = 1000 
+
     # Load data and preprocess as in your original code
     if not os.path.exists(path_to_save_df):
         os.makedirs(path_to_save_df)
 
+    # Load preprocessed corpus
     if os.path.exists(path_to_save_df + "preprocessed_corpus.pkl"):
         print("Loading preprocessed corpus...")
         corpus_df = pd.read_pickle(path_to_save_df + "preprocessed_corpus.pkl")
+        
+        # corp = pd.read_json(corpus_file_path)
+        # corpus_lang = corp[["docid", "lang"]]
+        # corpus_lang.set_index("docid", inplace=True)
+        # corpus_lang = corpus_lang.to_dict()["lang"]
+        
+        # with open(path_to_save_df + "corpus_lang.pkl", "wb") as f:
+        #     pickle.dump(corpus_lang, f)
+        # exit()
     else:
-        print("Loading and preprocessing corpus in batches...")
-        corpus_df = pd.read_json(corpus_file_path)
-        corpus_df = preprocess_corpus_in_batches(corpus_df, batch_size=BATCH_SIZE, n_jobs=cpu_count())
-        corpus_df.to_pickle(path_to_save_df + "preprocessed_corpus.pkl")
+        print("Loading and preprocessing corpus...")
+        corpus_df = load_and_preprocess_corpus(corpus_file_path)
         
         
 

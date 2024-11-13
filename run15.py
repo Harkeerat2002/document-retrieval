@@ -7,20 +7,25 @@ import os
 from scipy.sparse import lil_matrix, vstack, save_npz, load_npz, csr_matrix
 import gc
 from collections import Counter
-
+from multiprocessing import Pool, cpu_count
 from joblib import Parallel, delayed
 from scipy.sparse.linalg import norm
 from nltk.corpus import stopwords
 from ko_ww_stopwords.stop_words import ko_ww_stop_words
 from nltk.stem import PorterStemmer
 import string
+from sentence_transformers import SentenceTransformer
+from transformers import BertTokenizer, BertForSequenceClassification
+from numpy.linalg import norm as norms
+from sklearn.feature_extraction.text import CountVectorizer
 
+import torch
 # Paths
 path_to_save_df = "./data/pd_df_v2/"
 path_to_saved_file = "./data/saved_files_v2/"
 path_to_train_query = "./data/train.csv"
 corpus_file_path = "./data/corpus.json/corpus.json"
-path_save_emb = "./data/saved_files/"
+path_save_emb = "./data/saved_files_v2/"
 
 stop_words_dict = {
     "en": set(stopwords.words("english")),
@@ -37,10 +42,22 @@ stop_words_dict["ko"] = korean_stop_words
 
 stemmer = PorterStemmer()
 
+# Loading the Sentence Model
+#model = SentenceTransformer("sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+model = SentenceTransformer('sentence-transformers/paraphrase-xlm-r-multilingual-v1')
+
+
+# tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
+# model = BertForSequenceClassification.from_pretrained('bert-base-uncased')
 # Create path_to_save_df if it does not exist
 if not os.path.exists(path_to_save_df):
     os.makedirs(path_to_save_df)
 
+
+
+
+
+        
 
 # Helper function to preprocess text
 def preprocess(text, lan):
@@ -204,6 +221,45 @@ def bm25_score(query_terms, doc_id, tf_dict, idf_dict, avgdl, k1=1.5, b=0.75):
             score += term_idf * (numerator / denominator)
     return score
 
+
+def ranking_with_language_model(model, corpus, ranked_documents_dict, train_query, doc_embeddings_matrix, doc_ids_re, query_embedding_re):
+    # Rank the documents using the language model
+    ranked_documents_dict_re = {}
+    
+    for query_id in tqdm(ranked_documents_dict.keys(), desc="Ranking with Language Model"):
+        query_embedding = query_embedding_re[query_id]
+        
+        # Find the top 10 documents using the all the documents in ranked_documents_dict and ranking them with the language model
+        
+        
+    return ranked_documents_dict_re
+
+
+def train_language_model(corpus):
+    # Train the language model for the whole corpus
+    vectorizer = CountVectorizer()
+    
+    corpus_text = corpus["preprocessed_text"]
+    corpus_text = " ".join(corpus_text)
+    vectorizer.fit_transform([corpus_text])
+    
+    word_counts = vectorizer.transform(corpus["preprocessed_text"])
+    word_counts = word_counts.toarray()
+    
+    word_probs = word_counts / word_counts.sum(axis=1, keepdims=True)
+    
+    return vectorizer, word_probs
+        
+def compute_document_probability(query_text, corpus, vectorizer, word_probs):
+    query_terms = query_text.split()
+    doc_prob = 1.0
+    for term in query_terms:
+        if term in vectorizer.vocabulary_:
+            term_idx = vectorizer.vocabulary_[term]
+            doc_prob *= word_probs[0, term_idx]
+    return doc_prob
+
+
 # Rank documents with cosine similarity, then BM25
 def rank_documents_with_cosine_similarity_and_bm25(corpus, train_query, tf_dict, idf_dict, avgdl, batch_size=400):
     term_index = {term: idx for idx, term in enumerate(tf_dict.keys())}
@@ -212,16 +268,51 @@ def rank_documents_with_cosine_similarity_and_bm25(corpus, train_query, tf_dict,
         embeddings = load_embeddings_from_mmap(path_to_saved_file + "embeddings.npz")
         with open(path_to_saved_file + "doc_ids.pkl", "rb") as f:
             doc_ids = pickle.load(f)
+        with open(path_to_save_df + "corpus_lang.pkl", "rb") as f:
+            corpus_lang = pickle.load(f)
     else:
         with open(path_to_saved_file + "embeddings.pkl", "rb") as f:
             embeddings = pickle.load(f)
         save_embeddings_to_mmap(embeddings, path_to_saved_file + "embeddings.npy")
+
+
+    if os.path.exists(path_save_emb + "doc_embeddings_dict(xlm).pkl"):
+        print("Loading document embeddings...")
+        with open(path_save_emb + "doc_emb.pkl", "rb") as f:
+            document_embeddings = pickle.load(f)
+        doc_ids_re = list(document_embeddings.keys())
+        doc_embeddings_matrix = np.array([document_embeddings[doc_id] for doc_id in doc_ids_re])
+    else:
+        print("Generating document embeddings...")
+        document_embeddings = {}
+        for doc_id, doc_text in tqdm(corpus[["docid", "preprocessed_text"]].values, desc="Documents Embeddings for Re-ranking"):
+            document_embeddings[doc_id] = model.encode(doc_text)
+            
+        with open(path_save_emb + "doc_embeddings_dict(xlm)", "wb") as f:
+            pickle.dump(document_embeddings, f)
+            
+    # vectorizer, word_probs = train_language_model(corpus)
+    # with open(path_to_saved_file + "vectorizer.pkl", "wb") as f:
+    #     pickle.dump(vectorizer, f)
+    # with open(path_to_saved_file + "word_probs.pkl", "wb") as f:
+    #     pickle.dump(word_probs, f)
+            
+    # Normalize the embeddings
+        doc_ids_re = list(document_embeddings.keys())
+        doc_embeddings_matrix = np.array([document_embeddings[doc_id] for doc_id in doc_ids_re])
 
     doc_norms = norm(embeddings, axis=1).reshape(-1, 1)
     normalized_embeddings = embeddings.multiply(1 / doc_norms)
 
     ranked_documents_dict = {}
     num_queries = len(train_query)
+    query_lang_dict = {query_id: lang for query_id, lang in train_query[["id", "lang"]].values}
+    doc_lang_dict = {doc_id: lang for doc_id, lang in corpus_lang.items()}
+    
+    # query_embedding_re = {}
+    # for query_id, query_text in tqdm(train_query[["id", "preprocessed_query"]].values, desc="Generating Query Embeddings"):
+    #     query_embedding = model.encode(query_text)
+    #     query_embedding_re[query_id] = query_embedding
 
     for start in tqdm(range(0, num_queries, batch_size), desc="Ranking queries"):
         end = min(start + batch_size, num_queries)
@@ -236,16 +327,66 @@ def rank_documents_with_cosine_similarity_and_bm25(corpus, train_query, tf_dict,
         cosine_similarities = normalized_embeddings.dot(batch_query_embeddings.T).toarray()
         
         for i, (query_id, query_text) in enumerate(batch_queries):
-            top_indices = np.argsort(cosine_similarities[:, i])[::-1][:200]
+            top_indices = np.argsort(cosine_similarities[:, i])[::-1]
             query_terms = query_text.split()
+            
+            query_lang = query_lang_dict[query_id]
+            filtered_top_indices = []  
+            for idx in top_indices:
+                doc_id = doc_ids[idx]
+                doc_lang = doc_lang_dict[doc_id]
+                
+                if doc_lang == query_lang:
+                    filtered_top_indices.append(idx)
+                    
+                if len(filtered_top_indices) == 1000:
+                    break
 
             top_100_docs = [(doc_ids[idx], bm25_score(query_terms, doc_ids[idx], tf_dict, idf_dict, avgdl))
-                            for idx in top_indices]
-            top_10_bm25 = sorted(top_100_docs, key=lambda x: x[1], reverse=True)[:10]
+                            for idx in filtered_top_indices]
+            
+            top_500_docs = sorted(top_100_docs, key=lambda x: x[1], reverse=True)[:100]
+            
+            
+            ranked_documents_dict[query_id] = [doc[0] for doc in sorted(top_500_docs, key=lambda x: x[1], reverse=True)]   
+            
+            
+            
+            
+            
+            
+            
+            # store lang for each query
+            query_lang_dict[query_id] = query_lang
+            
 
-            ranked_documents_dict[query_id] = [doc[0] for doc in top_10_bm25]
-
-    return ranked_documents_dict
+    # print(ranked_documents_dict[0])   
+    
+    del embeddings
+    del normalized_embeddings
+    del document_embeddings
+    gc.collect()
+    
+    # Perform language embedding ranking
+    # ranked_documents_dict = ranking_with_language_model(model, corpus, ranked_documents_dict, train_query, doc_embeddings_matrix, doc_ids_re, query_embedding_re)
+    
+    # top_500_docs_unique = []
+    # for doc in ranked_documents_dict.values():
+    #     top_500_docs_unique.extend(doc)
+    
+    # print("top_500_docs_unique: ", len(top_500_docs_unique))
+    
+    # # Train the language model
+    # vectorizer, word_probs = train_language_model(corpus, top_500_docs_unique)
+    
+    # doc_probs = compute_document_probability(query_text, corpus, vectorizer, word_probs)
+    # ranked_indices = np.argsort(doc_probs)[::-1]
+    # top_10_docs = [top_500_docs_unique[idx] for idx in ranked_indices[:10]]
+    
+    
+            
+    
+    return ranked_documents_dict, query_lang_dict
 
 
 def load_and_preprocess_queries(path_to_train_query):
@@ -295,6 +436,8 @@ if __name__ == "__main__":
             
     # print(corpus_lang)
     # exit()
+    
+    
 
     # Load data and preprocess as in your original code
     if not os.path.exists(path_to_save_df):
@@ -381,28 +524,46 @@ if __name__ == "__main__":
     test_query_df = load_and_preprocess_queries(path_to_test_query)
     
 
-    ranked_docs = rank_documents_with_cosine_similarity_and_bm25(corpus_df, test_query_df, tf_dict, idf_dict, avgdl)
+    ranked_docs, query_lang_dict = rank_documents_with_cosine_similarity_and_bm25(corpus_df, test_query_df, tf_dict, idf_dict, avgdl)
     
     
 
     # Make a CSV with query_id and all the doc_ids in an array
     ranked_docs_df = pd.DataFrame(ranked_docs.items(), columns=["id", "docids"])
     
+    # Evaluation
     possitive_docs = list(test_query_df["positive_docs"])
-    
     pos_do = 0
+    
+    
+    query_per_lang = {}
+    for lang in query_lang_dict.values():
+        query_per_lang[lang] = 0
+    
+    # Get the number of query per language
+    for i in range(len(ranked_docs_df)):
+        query_per_lang[query_lang_dict[ranked_docs_df["id"][i]]] += 1
+    
+    per_lang_performance = {}
+    # set the keys of per_lang_perfornance to the languages
+    for lang in query_lang_dict.values():
+        per_lang_performance[lang] = 0
     
     for i in range(len(ranked_docs_df)):
         if possitive_docs[i] in ranked_docs_df["docids"][i]:
             pos_do += 1
-            
+            per_lang_performance[query_lang_dict[ranked_docs_df["id"][i]]] += 1
             
     per = pos_do / len(ranked_docs_df)        
-    print(f"Number of positive docs found: {pos_do} / {len(ranked_docs_df) }, Percentage: {per}")
+    print(f"Number of positive docs found: {pos_do} / {len(ranked_docs_df)}, Percentage: {per}")
     
+    for lang, val in per_lang_performance.items():
+        percent = val / query_per_lang[lang]
+        print(f"Language: {lang}, Number of positive docs found: {val} / {query_per_lang[lang]}, Percentage: {percent}")
+    
+    # # Evaluation per Language
 
-    # # for the id remove everything except the number ID format q-en-0000
-    # ranked_docs_df["id"] = ranked_docs_df["id"].str.extract(r"(\d+)")
+    
 
     ranked_docs_df.to_csv(path_to_save_df + "submission.csv", index=False)
 
